@@ -1,0 +1,8 @@
+.env
+*.sqlite
+.venv/
+__pycache__/
+*.pyc
+# Accidental venv dirs (e.g. typo in `python -m venv …`)
+or/
+\#/
