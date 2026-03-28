@@ -16,6 +16,14 @@ from bea_client import (
 )
 from config import BEA_API_KEY, DB_PATH, DEFAULT_PROPERTY_TYPE, STATE_NAME_TO_POSTAL
 from db import connect, fetch_series, init_db, list_regions_for_state, list_states
+from fed_dti import (
+    format_dti_period,
+    format_dti_range,
+    latest_msa_dti_row,
+    latest_state_dti_row,
+    load_dti_zip,
+    STATE_ZIP_URL,
+)
 from ingest import (
     ingest_cities_for_state,
     ingest_metros,
@@ -157,6 +165,11 @@ def _bea_barometer_cached(
         "tone": tone,
         "scope_note": scope_note,
     }
+
+
+@st.cache_data(ttl=86400 * 7, show_spinner=False)
+def _fed_dti_frames():
+    return load_dti_zip(STATE_ZIP_URL), load_dti_zip(MSA_ZIP_URL)
 
 
 st.set_page_config(
@@ -383,17 +396,64 @@ else:
             st.plotly_chart(
                 gauge_figure(
                     pack["fear"],
-                    "Pressure index (0 calm → 100 stressed)",
-                    f"{pack['tone']} Latest income period: {inc.latest_period or '—'}; PCE: {pce.latest_period or '—'}.",
+                    income_period=inc.latest_period or "—",
+                    pce_period=pce.latest_period or "—",
                 ),
                 use_container_width=True,
             )
         with g2:
             st.markdown(
-                "**How to read it:** The gauge blends BEA income growth and state PCE growth into one score. "
-                "It is a macro backdrop for your housing charts, not a trading signal. "
-                "Metro and city views use **metro** personal income when Redfin supplies a CBSA `metro_code`, and **state** PCE."
+                "**How to read it:** Green **Confident**, yellow **Uncertain**, red **Fear** — based on BEA "
+                "income and state PCE growth vs simple benchmarks (not a trading signal). "
+                "Metro/city income uses CBSA when Redfin provides `metro_code`."
             )
+
+st.divider()
+st.subheader("Debt-to-income ratio (budget tightness)")
+st.caption(
+    "[Federal Reserve Z.1 Data Visualization](https://www.federalreserve.gov/releases/z1/default.htm) "
+    "— household debt-to-income **ranges** (low–high) by state and by MSA. Quarterly; higher mid-range ≈ tighter budgets."
+)
+
+try:
+    state_dti_df, msa_dti_df = _fed_dti_frames()
+    dti_left, dti_right = st.columns(2)
+    st_dti = latest_state_dti_row(state_dti_df, sel_state)
+    with dti_left:
+        if st_dti is not None:
+            st.markdown(f"**{sel_state}** (state)")
+            st.metric(
+                "Debt-to-income (range)",
+                format_dti_range(st_dti),
+                help="Fed low–high band for the state.",
+            )
+            st.caption(format_dti_period(st_dti))
+        else:
+            st.warning(f"No state DTI for **{sel_state}**.")
+
+    mc_dti = _metro_code_from_frame(df) if level != "State" else None
+    with dti_right:
+        if level != "State" and mc_dti:
+            m_row = latest_msa_dti_row(msa_dti_df, mc_dti)
+            if m_row is not None:
+                st.markdown(f"**MSA** `{mc_dti}`")
+                st.metric(
+                    "Debt-to-income (range)",
+                    format_dti_range(m_row),
+                    help="Fed low–high band for this metropolitan area.",
+                )
+                st.caption(format_dti_period(m_row))
+            else:
+                st.info(f"No MSA row for CBSA **{mc_dti}** in the Fed extract.")
+        elif level != "State":
+            st.caption("Re-ingest **metro/city** so `metro_code` is present for MSA DTI.")
+
+    st.info(
+        "**Rough read of the range (midpoint):** ~1.0–1.4 often **more comfortable**, ~1.5–1.8 **moderate pressure**, "
+        "above ~**1.8** **tighter** budgets — interpretation is qualitative; see Fed documentation for definitions."
+    )
+except Exception as e:
+    st.error(f"Could not load Federal Reserve DTI files: {e}")
 
 st.markdown(summary_markdown(latest, label))
 
@@ -452,3 +512,9 @@ if "months_of_supply" in display.columns:
         lambda x: f"{float(x):.1f}" if pd.notna(x) else "—"
     )
 st.dataframe(display, use_container_width=True, hide_index=True)
+
+st.caption(
+    "**Sources:** Housing — [Redfin Data Center](https://www.redfin.com/news/data-center/) · "
+    "Economic pressure — BEA Regional API · "
+    "Debt-to-income — [Federal Reserve Z.1 data download](https://www.federalreserve.gov/releases/z1/default.htm)."
+)

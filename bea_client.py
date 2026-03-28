@@ -402,46 +402,96 @@ def fear_barometer_score(
     confidence = (s_inc + s_pce) / 2.0
     fear = 100.0 - confidence
     if fear >= 66:
-        tone = "Elevated pressure — income or spending growth is weak versus typical ranges."
+        tone = "Fear"
     elif fear <= 33:
-        tone = "Mild — income and spending growth look firm versus typical ranges."
+        tone = "Confident"
     else:
-        tone = "Mixed — one of income or spending is soft relative to the other."
+        tone = "Uncertain"
     return round(fear, 1), tone
 
 
-def gauge_figure(
-    fear_score: float,
-    title: str,
-    subtitle: str,
-) -> Any:
+def gauge_figure(fear_score: float, *, income_period: str, pce_period: str) -> Any:
     import plotly.graph_objects as go
+
+    if fear_score >= 66:
+        zone, bar_color = "Fear", "#b71c1c"
+    elif fear_score <= 33:
+        zone, bar_color = "Confident", "#1b5e20"
+    else:
+        zone, bar_color = "Uncertain", "#f57f17"
+
+    subtitle = (
+        f"{zone} · Income: {income_period or '—'} · PCE: {pce_period or '—'}"
+    )
 
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=fear_score,
-            number={"suffix": "/100"},
-            title={"text": subtitle, "font": {"size": 14}},
+            number={"suffix": "/100", "font": {"size": 36}},
+            title={"text": subtitle, "font": {"size": 13}},
             gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": "#5c6bc0"},
+                "axis": {"range": [0, 100], "tickwidth": 1},
+                "bar": {"color": bar_color, "thickness": 0.35},
+                "bgcolor": "white",
                 "steps": [
-                    {"range": [0, 33], "color": "#e8f5e9"},
-                    {"range": [33, 66], "color": "#fff9c4"},
-                    {"range": [66, 100], "color": "#ffebee"},
+                    {
+                        "range": [0, 33.33],
+                        "color": "#c8e6c9",
+                        "name": "Confident",
+                    },
+                    {
+                        "range": [33.33, 66.66],
+                        "color": "#fff9c4",
+                        "name": "Uncertain",
+                    },
+                    {"range": [66.66, 100], "color": "#ffcdd2", "name": "Fear"},
                 ],
                 "threshold": {
-                    "line": {"color": "black", "width": 2},
-                    "thickness": 0.8,
+                    "line": {"color": "#212121", "width": 3},
+                    "thickness": 0.85,
                     "value": fear_score,
                 },
             },
         )
     )
     fig.update_layout(
-        title={"text": title, "xanchor": "left", "x": 0, "font": {"size": 18}},
-        height=320,
-        margin=dict(t=64, b=32, l=24, r=24),
+        title={
+            "text": "Economic pressure (BEA income & state PCE)",
+            "xanchor": "left",
+            "x": 0,
+            "font": {"size": 17},
+        },
+        height=340,
+        margin=dict(t=72, b=48, l=24, r=24),
+        annotations=[
+            {
+                "x": 0.08,
+                "y": -0.06,
+                "xref": "paper",
+                "yref": "paper",
+                "text": "<b>Confident</b>",
+                "showarrow": False,
+                "font": {"size": 12, "color": "#1b5e20"},
+            },
+            {
+                "x": 0.5,
+                "y": -0.06,
+                "xref": "paper",
+                "yref": "paper",
+                "text": "<b>Uncertain</b>",
+                "showarrow": False,
+                "font": {"size": 12, "color": "#f57f17"},
+            },
+            {
+                "x": 0.92,
+                "y": -0.06,
+                "xref": "paper",
+                "yref": "paper",
+                "text": "<b>Fear</b>",
+                "showarrow": False,
+                "font": {"size": 12, "color": "#b71c1c"},
+            },
+        ],
     )
     return fig
