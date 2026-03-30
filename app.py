@@ -22,6 +22,7 @@ from fed_dti import (
     latest_msa_dti_row,
     latest_state_dti_row,
     load_dti_zip,
+    MSA_ZIP_URL,
     STATE_ZIP_URL,
 )
 from ingest import (
