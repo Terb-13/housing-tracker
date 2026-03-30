@@ -8,13 +8,11 @@ from plotly.subplots import make_subplots
 from analytics import latest_row, summary_markdown, trend_from_change
 from bea_client import (
     BeaSeriesResult,
-    fear_barometer_score,
     fetch_metro_annual_income_yoy,
     fetch_state_annual_pce_yoy,
     fetch_state_quarterly_income_yoy,
-    gauge_figure,
 )
-from config import BEA_API_KEY, DB_PATH, DEFAULT_PROPERTY_TYPE, STATE_NAME_TO_POSTAL
+from config import BEA_API_KEY, DB_PATH, DEFAULT_PROPERTY_TYPE, FRED_API_KEY, STATE_NAME_TO_POSTAL
 from db import connect, fetch_series, init_db, list_regions_for_state, list_states
 from fed_dti import (
     format_dti_period,
@@ -25,6 +23,8 @@ from fed_dti import (
     MSA_ZIP_URL,
     STATE_ZIP_URL,
 )
+from fred_client import latest_state_unemployment_rate
+from pressure_index import composite_pressure_gauge_figure, compute_composite_pressure
 from ingest import (
     ingest_cities_for_state,
     ingest_metros,
@@ -155,15 +155,9 @@ def _bea_barometer_cached(
             "**Income:** metropolitan statistical area (CBSA) annual personal income (latest year vs prior). "
             "**Spending:** still **state-level** total PCE — BEA’s published PCE-by-state series does not map 1:1 to this metro."
         )
-    fear, tone = fear_barometer_score(
-        inc.yoy_pct if inc.error is None else None,
-        pce.yoy_pct if pce.error is None else None,
-    )
     return {
         "income": inc,
         "pce": pce,
-        "fear": fear,
-        "tone": tone,
         "scope_note": scope_note,
     }
 
@@ -181,9 +175,8 @@ st.set_page_config(
 
 st.title("Local housing market tracker")
 st.caption(
-    "Uses [Redfin Data Center](https://www.redfin.com/news/data-center/) public monthly metrics "
-    "(median sale price, inventory, new listings, days on market, months of supply). "
-    "**Not** live MLS; updates monthly."
+    "[Redfin](https://www.redfin.com/news/data-center/) housing · composite **Consumer Financial Pressure Index** · "
+    "[Fed](https://www.federalreserve.gov/releases/z1/default.htm) DTI · [BEA](https://www.bea.gov/) · [FRED](https://fred.stlouisfed.org/) unemployment."
 )
 
 with st.sidebar:
@@ -327,195 +320,259 @@ except (TypeError, ValueError):
     mom_f = None
 price_trend = trend_from_change(mom_f)
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Price trend (MoM)", price_trend.replace("unknown", "n/a").title())
-with c2:
-    v = latest["median_sale_price"] if latest is not None else None
-    st.metric(
-        "Median sale (latest month)",
-        f"${float(v):,.0f}" if v is not None and pd.notna(v) else "—",
-    )
-with c3:
-    v = latest["median_dom"] if latest is not None else None
-    st.metric(
-        "Median days on market",
-        f"{int(v)}" if v is not None and pd.notna(v) else "—",
-    )
-with c4:
-    v = latest["months_of_supply"] if latest is not None else None
-    st.metric(
-        "Months of supply",
-        f"{float(v):.1f}" if v is not None and pd.notna(v) else "—",
-    )
-
-st.divider()
-st.subheader("Household earning & spending barometer")
-st.caption(
-    "A simple macro “pressure” gauge from **Bureau of Economic Analysis** regional accounts — "
-    "not options flow like Unusual Whales. **Higher reading = more pressure** (weaker growth in income or spending vs typical)."
+tab_housing, tab_pressure, tab_dti = st.tabs(
+    ("Housing market", "Consumer Financial Pressure Index", "Debt-to-income (Fed)")
 )
 
-if not BEA_API_KEY:
-    st.info("Add `BEA_API_KEY` to your `.env` file to load BEA income & PCE data here.")
-else:
+with tab_housing:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Price trend (MoM)", price_trend.replace("unknown", "n/a").title())
+    with c2:
+        v = latest["median_sale_price"] if latest is not None else None
+        st.metric(
+            "Median sale (latest month)",
+            f"${float(v):,.0f}" if v is not None and pd.notna(v) else "—",
+        )
+    with c3:
+        v = latest["median_dom"] if latest is not None else None
+        st.metric(
+            "Median days on market",
+            f"{int(v)}" if v is not None and pd.notna(v) else "—",
+        )
+    with c4:
+        v = latest["months_of_supply"] if latest is not None else None
+        st.metric(
+            "Months of supply",
+            f"{float(v):.1f}" if v is not None and pd.notna(v) else "—",
+        )
+
+    st.markdown(summary_markdown(latest, label))
+
     try:
-        postal = _state_postal_from_row(latest, sel_state)
+        fig = _figure_timeseries(df, label)
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not build chart: {e}")
+
+    st.subheader("Recent months (table)")
+    show = df.sort_values("period_begin", ascending=False).head(24)
+    cols = [
+        "period_begin",
+        "median_sale_price",
+        "median_sale_price_mom",
+        "median_sale_price_yoy",
+        "inventory",
+        "inventory_mom",
+        "new_listings",
+        "new_listings_mom",
+        "median_dom",
+        "median_dom_mom",
+        "median_dom_yoy",
+        "months_of_supply",
+        "homes_sold",
+    ]
+    show = show[[c for c in cols if c in show.columns]]
+    display = show.copy()
+    if "median_sale_price" in display.columns:
+        display["median_sale_price"] = display["median_sale_price"].apply(
+            lambda x: f"${x:,.0f}" if pd.notna(x) else "—"
+        )
+    pct_exclude = {"median_dom_mom", "median_dom_yoy"}
+    for c in display.columns:
+        if (c.endswith("_mom") or c.endswith("_yoy")) and c not in pct_exclude:
+            display[c] = display[c].apply(
+                lambda x: f"{float(x) * 100:+.1f}%" if pd.notna(x) else "—"
+            )
+    for c in (
+        "inventory",
+        "new_listings",
+        "median_dom",
+        "homes_sold",
+    ):
+        if c in display.columns:
+            display[c] = display[c].apply(
+                lambda x: f"{int(round(float(x)))}" if pd.notna(x) else "—"
+            )
+    for c in ("median_dom_mom", "median_dom_yoy"):
+        if c in display.columns:
+            display[c] = show[c].apply(
+                lambda x: f"{float(x):+.1f} d" if pd.notna(x) else "—"
+            )
+    if "months_of_supply" in display.columns:
+        display["months_of_supply"] = display["months_of_supply"].apply(
+            lambda x: f"{float(x):.1f}" if pd.notna(x) else "—"
+        )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+with tab_pressure:
+    st.subheader("Consumer Financial Pressure Index")
+    st.caption(
+        "**0–30** = very secure · **31–60** = moderate pressure · **61–100** = high pressure. "
+        "Blends Fed **DTI**, BEA **PCE vs income** growth, **Redfin** housing softness, state **unemployment** (FRED)."
+    )
+    if not FRED_API_KEY:
+        st.info(
+            "Add **`FRED_API_KEY`** to `.env` or Streamlit secrets ([get a free key](https://fred.stlouisfed.org/docs/api/api_key.html)) "
+            "for state unemployment; without it, that factor is scored as neutral."
+        )
+
+    try:
+        postal_idx = _state_postal_from_row(latest, sel_state)
     except KeyError:
-        postal = ""
-        st.warning("Could not resolve a state postal code for BEA; check your housing row `state_code`.")
+        postal_idx = ""
 
-    if postal:
-        mc = _metro_code_from_frame(df) if level != "State" else None
-        pack = _bea_barometer_cached(level, postal, mc, BEA_API_KEY)
-        inc, pce = pack["income"], pack["pce"]
+    dti_mid: float | None = None
+    try:
+        state_dti_df, _ = _fed_dti_frames()
+        _st_dti_row = latest_state_dti_row(state_dti_df, sel_state)
+        if _st_dti_row is not None:
+            dti_mid = (float(_st_dti_row["low"]) + float(_st_dti_row["high"])) / 2.0
+    except Exception:
+        pass
+
+    inc_y = pce_y = None
+    pack_bea = None
+    if BEA_API_KEY and postal_idx:
+        mc_bea = _metro_code_from_frame(df) if level != "State" else None
+        pack_bea = _bea_barometer_cached(level, postal_idx, mc_bea, BEA_API_KEY)
+        inc, pce = pack_bea["income"], pack_bea["pce"]
         if inc.error:
-            st.warning(f"BEA income series: {inc.error}")
+            st.warning(f"BEA income: {inc.error}")
         if pce.error:
-            st.warning(f"BEA spending series: {pce.error}")
-
-        m1, m2 = st.columns(2)
-        with m1:
-            ip = inc.yoy_pct
+            st.warning(f"BEA PCE: {pce.error}")
+        inc_y = inc.yoy_pct if inc.error is None else None
+        pce_y = pce.yoy_pct if pce.error is None else None
+        b1, b2 = st.columns(2)
+        with b1:
             st.metric(
-                "Earnings momentum (BEA)",
-                f"{ip * 100:+.1f}% YoY" if ip is not None and pd.notna(ip) else "—",
-                help=inc.label,
+                "State income YoY (BEA, Q)",
+                f"{float(inc_y) * 100:+.1f}%"
+                if inc_y is not None and pd.notna(inc_y)
+                else "—",
+                help="Latest quarter vs same quarter prior year.",
             )
-        with m2:
-            pp = pce.yoy_pct
+        with b2:
             st.metric(
-                "Spending momentum (PCE, BEA)",
-                f"{pp * 100:+.1f}% YoY" if pp is not None and pd.notna(pp) else "—",
-                help=pce.label,
+                "State PCE YoY (BEA, annual)",
+                f"{float(pce_y) * 100:+.1f}%"
+                if pce_y is not None and pd.notna(pce_y)
+                else "—",
+                help="Latest year vs prior (not same frequency as income — gap is indicative).",
             )
+        st.caption(pack_bea["scope_note"])
+    elif not BEA_API_KEY:
+        st.warning("Set **`BEA_API_KEY`** for income and PCE in this index.")
 
-        st.caption(pack["scope_note"])
+    def _fv(key: str):
+        if latest is None or key not in latest.index:
+            return None
+        v = latest[key]
+        try:
+            return float(v) if pd.notna(v) else None
+        except (TypeError, ValueError):
+            return None
 
-        g1, g2 = st.columns([1, 2])
-        with g1:
-            st.plotly_chart(
-                gauge_figure(
-                    pack["fear"],
-                    income_period=inc.latest_period or "—",
-                    pce_period=pce.latest_period or "—",
-                ),
-                use_container_width=True,
+    un_rate, un_date, un_sid = latest_state_unemployment_rate(postal_idx, FRED_API_KEY)
+
+    composite = compute_composite_pressure(
+        dti_mid=dti_mid,
+        income_yoy=inc_y,
+        pce_yoy=pce_y,
+        median_dom=_fv("median_dom"),
+        inventory_mom=_fv("inventory_mom"),
+        median_dom_mom=_fv("median_dom_mom"),
+        unemployment_pct=un_rate,
+    )
+
+    gu, br = st.columns([1, 1])
+    with gu:
+        if pack_bea:
+            _inc, _pce = pack_bea["income"], pack_bea["pce"]
+            gauge_sub = (
+                f"{composite.zone} · Income: {_inc.latest_period or '—'} · "
+                f"PCE: {_pce.latest_period or '—'}"
             )
-        with g2:
-            st.markdown(
-                "**How to read it:** Green **Confident**, yellow **Uncertain**, red **Fear** — based on BEA "
-                "income and state PCE growth vs simple benchmarks (not a trading signal). "
-                "Metro/city income uses CBSA when Redfin provides `metro_code`."
-            )
-
-st.divider()
-st.subheader("Debt-to-income ratio (budget tightness)")
-st.caption(
-    "[Federal Reserve Z.1 Data Visualization](https://www.federalreserve.gov/releases/z1/default.htm) "
-    "— household debt-to-income **ranges** (low–high) by state and by MSA. Quarterly; higher mid-range ≈ tighter budgets."
-)
-
-try:
-    state_dti_df, msa_dti_df = _fed_dti_frames()
-    dti_left, dti_right = st.columns(2)
-    st_dti = latest_state_dti_row(state_dti_df, sel_state)
-    with dti_left:
-        if st_dti is not None:
-            st.markdown(f"**{sel_state}** (state)")
-            st.metric(
-                "Debt-to-income (range)",
-                format_dti_range(st_dti),
-                help="Fed low–high band for the state.",
-            )
-            st.caption(format_dti_period(st_dti))
         else:
-            st.warning(f"No state DTI for **{sel_state}**.")
+            gauge_sub = composite.zone
+        st.plotly_chart(
+            composite_pressure_gauge_figure(composite.index, gauge_sub),
+            use_container_width=True,
+        )
+    with br:
+        st.metric("Index", f"{composite.index:.1f}", help="Weighted blend; higher = more consumer pressure.")
+        if dti_mid is not None:
+            st.metric("DTI midpoint (state, Fed)", f"{dti_mid:.2f}")
+        if un_rate is not None:
+            st.metric(
+                "Unemployment (state, FRED)",
+                f"{un_rate:.2f}%",
+                f"{un_sid or ''} · {un_date or ''}",
+            )
+        else:
+            st.metric("Unemployment (state, FRED)", "—", "Add FRED_API_KEY")
+        if inc_y is not None and pce_y is not None:
+            st.metric(
+                "PCE YoY − income YoY (approx.)",
+                f"{(float(pce_y) - float(inc_y)) * 100:+.1f} pp",
+            )
 
-    mc_dti = _metro_code_from_frame(df) if level != "State" else None
-    with dti_right:
-        if level != "State" and mc_dti:
-            m_row = latest_msa_dti_row(msa_dti_df, mc_dti)
-            if m_row is not None:
-                st.markdown(f"**MSA** `{mc_dti}`")
+    st.subheader("Factor breakdown (subscores 0–100, higher = more pressure)")
+    st.dataframe(composite.detail_rows, use_container_width=True, hide_index=True)
+    st.info(
+        "**Weights:** DTI 35%, PCE−income gap 18%, housing (DOM + inventory) 22%, income YoY 13%, "
+        "state unemployment (FRED) 12%. Income is **quarterly** YoY vs prior year quarter; PCE is **annual** YoY — "
+        "the gap is indicative, not an exact national-accounts residual."
+    )
+
+with tab_dti:
+    st.subheader("Debt-to-income ratio (budget tightness)")
+    st.caption(
+        "[Federal Reserve Z.1 Data Visualization](https://www.federalreserve.gov/releases/z1/default.htm) "
+        "— household debt-to-income **ranges** (low–high) by state and by MSA. Quarterly."
+    )
+
+    try:
+        state_dti_df, msa_dti_df = _fed_dti_frames()
+        dti_left, dti_right = st.columns(2)
+        st_dti = latest_state_dti_row(state_dti_df, sel_state)
+        with dti_left:
+            if st_dti is not None:
+                st.markdown(f"**{sel_state}** (state)")
                 st.metric(
                     "Debt-to-income (range)",
-                    format_dti_range(m_row),
-                    help="Fed low–high band for this metropolitan area.",
+                    format_dti_range(st_dti),
+                    help="Fed low–high band for the state.",
                 )
-                st.caption(format_dti_period(m_row))
+                st.caption(format_dti_period(st_dti))
             else:
-                st.info(f"No MSA row for CBSA **{mc_dti}** in the Fed extract.")
-        elif level != "State":
-            st.caption("Re-ingest **metro/city** so `metro_code` is present for MSA DTI.")
+                st.warning(f"No state DTI for **{sel_state}**.")
 
-    st.info(
-        "**Rough read of the range (midpoint):** ~1.0–1.4 often **more comfortable**, ~1.5–1.8 **moderate pressure**, "
-        "above ~**1.8** **tighter** budgets — interpretation is qualitative; see Fed documentation for definitions."
-    )
-except Exception as e:
-    st.error(f"Could not load Federal Reserve DTI files: {e}")
+        mc_dti = _metro_code_from_frame(df) if level != "State" else None
+        with dti_right:
+            if level != "State" and mc_dti:
+                m_row = latest_msa_dti_row(msa_dti_df, mc_dti)
+                if m_row is not None:
+                    st.markdown(f"**MSA** `{mc_dti}`")
+                    st.metric(
+                        "Debt-to-income (range)",
+                        format_dti_range(m_row),
+                        help="Fed low–high band for this metropolitan area.",
+                    )
+                    st.caption(format_dti_period(m_row))
+                else:
+                    st.info(f"No MSA row for CBSA **{mc_dti}** in the Fed extract.")
+            elif level != "State":
+                st.caption("Re-ingest **metro/city** so `metro_code` is present for MSA DTI.")
 
-st.markdown(summary_markdown(latest, label))
-
-try:
-    fig = _figure_timeseries(df, label)
-    st.plotly_chart(fig, use_container_width=True)
-except Exception as e:
-    st.warning(f"Could not build chart: {e}")
-
-st.subheader("Recent months (table)")
-show = df.sort_values("period_begin", ascending=False).head(24)
-cols = [
-    "period_begin",
-    "median_sale_price",
-    "median_sale_price_mom",
-    "median_sale_price_yoy",
-    "inventory",
-    "inventory_mom",
-    "new_listings",
-    "new_listings_mom",
-    "median_dom",
-    "median_dom_mom",
-    "median_dom_yoy",
-    "months_of_supply",
-    "homes_sold",
-]
-show = show[[c for c in cols if c in show.columns]]
-display = show.copy()
-if "median_sale_price" in display.columns:
-    display["median_sale_price"] = display["median_sale_price"].apply(
-        lambda x: f"${x:,.0f}" if pd.notna(x) else "—"
-    )
-pct_exclude = {"median_dom_mom", "median_dom_yoy"}
-for c in display.columns:
-    if (c.endswith("_mom") or c.endswith("_yoy")) and c not in pct_exclude:
-        display[c] = display[c].apply(
-            lambda x: f"{float(x) * 100:+.1f}%" if pd.notna(x) else "—"
+        st.info(
+            "**Rough read (midpoint):** ~1.0–1.4 often more **comfortable**, ~1.5–1.8 **moderate**, "
+            "above ~**1.8** **tighter** — see Fed documentation for definitions."
         )
-for c in (
-    "inventory",
-    "new_listings",
-    "median_dom",
-    "homes_sold",
-):
-    if c in display.columns:
-        display[c] = display[c].apply(
-            lambda x: f"{int(round(float(x)))}" if pd.notna(x) else "—"
-        )
-for c in ("median_dom_mom", "median_dom_yoy"):
-    if c in display.columns:
-        display[c] = show[c].apply(
-            lambda x: f"{float(x):+.1f} d" if pd.notna(x) else "—"
-        )
-if "months_of_supply" in display.columns:
-    display["months_of_supply"] = display["months_of_supply"].apply(
-        lambda x: f"{float(x):.1f}" if pd.notna(x) else "—"
-    )
-st.dataframe(display, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Could not load Federal Reserve DTI files: {e}")
 
 st.caption(
     "**Sources:** Housing — [Redfin Data Center](https://www.redfin.com/news/data-center/) · "
-    "Economic pressure — BEA Regional API · "
-    "Debt-to-income — [Federal Reserve Z.1 data download](https://www.federalreserve.gov/releases/z1/default.htm)."
+    "Pressure index — BEA + Redfin + Fed Z.1 DTI + [FRED](https://fred.stlouisfed.org/) unemployment."
 )
