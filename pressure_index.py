@@ -166,7 +166,7 @@ def compute_composite_pressure(
             "Note": (
                 f"{unemployment_pct:.2f}%"
                 if unemployment_pct is not None
-                else "Add FRED_API_KEY"
+                else "FRED public CSV"
             ),
         },
     ]

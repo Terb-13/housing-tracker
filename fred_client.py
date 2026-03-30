@@ -1,12 +1,16 @@
-"""FRED (Federal Reserve Economic Data) — state unemployment rate (monthly, %)."""
+"""State unemployment from FRED via public CSV (no API key required)."""
 
 from __future__ import annotations
 
-from typing import Any
+import io
 
+import pandas as pd
 import requests
 
-FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_GRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+# Conservative UA; FRED may throttle bare clients.
+_HEADERS = {"User-Agent": "housing-tracker/1.0 (local dashboard; educational)"}
 
 
 def unemployment_series_id(state_postal: str) -> str:
@@ -18,41 +22,42 @@ def unemployment_series_id(state_postal: str) -> str:
 
 
 def latest_state_unemployment_rate(
-    state_postal: str, api_key: str
+    state_postal: str,
 ) -> tuple[float | None, str | None, str | None]:
     """
-    Returns (rate_percent, observation_date, series_id) or (None, None, sid) on failure.
-    Rate is a percent (e.g. 3.6 for 3.6%), not decimal.
+    Returns (rate_percent, observation_date, series_id).
+    Uses https://fred.stlouisfed.org/graph/fredgraph.csv?id=SERIES — no FRED API key.
     """
-    key = (api_key or "").strip()
-    if not key:
+    if not (state_postal or "").strip():
         return None, None, None
     sid = unemployment_series_id(state_postal)
     try:
         r = requests.get(
-            FRED_OBSERVATIONS_URL,
-            params={
-                "series_id": sid,
-                "api_key": key,
-                "file_type": "json",
-                "sort_order": "desc",
-                "limit": 12,
-            },
-            timeout=45,
+            FRED_GRAPH_CSV,
+            params={"id": sid},
+            timeout=60,
+            headers=_HEADERS,
         )
         r.raise_for_status()
-        payload: dict[str, Any] = r.json()
-        obs = payload.get("observations") or []
-        for row in obs:
-            v = row.get("value")
-            if v is None or str(v) in (".", "", "nan"):
-                continue
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [str(c).strip() for c in df.columns]
+        if df.empty or len(df.columns) < 2:
+            return None, None, sid
+        date_col = "observation_date" if "observation_date" in df.columns else df.columns[0]
+        rest = [c for c in df.columns if c != date_col]
+        val_col = sid if sid in df.columns else (rest[0] if rest else None)
+        if val_col is None:
+            return None, None, sid
+        for i in range(len(df) - 1, -1, -1):
+            raw = df.iloc[i][val_col]
             try:
-                rate = float(v)
-            except ValueError:
+                rate = float(raw)
+            except (TypeError, ValueError):
                 continue
-            d = row.get("date")
-            return rate, str(d) if d else None, sid
-    except (requests.RequestException, KeyError, ValueError, TypeError):
+            if pd.isna(rate):
+                continue
+            d = df.iloc[i][date_col]
+            return rate, str(d) if d is not None and str(d) != "nan" else None, sid
+    except (requests.RequestException, ValueError, IndexError, KeyError):
         pass
     return None, None, sid

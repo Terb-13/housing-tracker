@@ -12,7 +12,7 @@ from bea_client import (
     fetch_state_annual_pce_yoy,
     fetch_state_quarterly_income_yoy,
 )
-from config import BEA_API_KEY, DB_PATH, DEFAULT_PROPERTY_TYPE, FRED_API_KEY, STATE_NAME_TO_POSTAL
+from config import BEA_API_KEY, DB_PATH, DEFAULT_PROPERTY_TYPE, STATE_NAME_TO_POSTAL
 from db import connect, fetch_series, init_db, list_regions_for_state, list_states
 from fed_dti import (
     format_dti_period,
@@ -409,13 +409,9 @@ with tab_pressure:
     st.subheader("Consumer Financial Pressure Index")
     st.caption(
         "**0–30** = very secure · **31–60** = moderate pressure · **61–100** = high pressure. "
-        "Blends Fed **DTI**, BEA **PCE vs income** growth, **Redfin** housing softness, state **unemployment** (FRED)."
+        "Blends Fed **DTI**, BEA **PCE vs income** growth, **Redfin** housing softness, state **unemployment** "
+        "(from [FRED](https://fred.stlouisfed.org/) public CSV — no API key)."
     )
-    if not FRED_API_KEY:
-        st.info(
-            "Add **`FRED_API_KEY`** to `.env` or Streamlit secrets ([get a free key](https://fred.stlouisfed.org/docs/api/api_key.html)) "
-            "for state unemployment; without it, that factor is scored as neutral."
-        )
 
     try:
         postal_idx = _state_postal_from_row(latest, sel_state)
@@ -473,7 +469,7 @@ with tab_pressure:
         except (TypeError, ValueError):
             return None
 
-    un_rate, un_date, un_sid = latest_state_unemployment_rate(postal_idx, FRED_API_KEY)
+    un_rate, un_date, un_sid = latest_state_unemployment_rate(postal_idx)
 
     composite = compute_composite_pressure(
         dti_mid=dti_mid,
@@ -510,7 +506,7 @@ with tab_pressure:
                 f"{un_sid or ''} · {un_date or ''}",
             )
         else:
-            st.metric("Unemployment (state, FRED)", "—", "Add FRED_API_KEY")
+            st.metric("Unemployment (state, FRED)", "—", "CSV fetch failed")
         if inc_y is not None and pce_y is not None:
             st.metric(
                 "PCE YoY − income YoY (approx.)",

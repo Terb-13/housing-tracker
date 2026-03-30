@@ -9,7 +9,6 @@ load_dotenv(PROJECT_ROOT / ".env")
 DATA_DIR = Path(os.getenv("HOUSING_DATA_DIR", PROJECT_ROOT / "data"))
 DB_PATH = Path(os.getenv("HOUSING_DB_PATH", PROJECT_ROOT / "housing_market.sqlite"))
 BEA_API_KEY = (os.getenv("BEA_API_KEY") or "").strip()
-FRED_API_KEY = (os.getenv("FRED_API_KEY") or "").strip()
 
 REDFIN_BASE = "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker"
 REDFIN_URLS = {
