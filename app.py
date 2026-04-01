@@ -122,6 +122,16 @@ def _metro_code_from_frame(df: pd.DataFrame) -> str | None:
     return v or None
 
 
+def _latest_float(latest: pd.Series | None, key: str) -> float | None:
+    if latest is None or key not in latest.index:
+        return None
+    v = latest[key]
+    try:
+        return float(v) if pd.notna(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _bea_barometer_cached(
     geography: str,
@@ -162,6 +172,13 @@ def _bea_barometer_cached(
     }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fred_unemployment_cached(
+    state_postal: str,
+) -> tuple[float | None, str | None, str | None]:
+    return latest_state_unemployment_rate(state_postal)
+
+
 @st.cache_data(ttl=86400 * 7, show_spinner=False)
 def _fed_dti_frames():
     return load_dti_zip(STATE_ZIP_URL), load_dti_zip(MSA_ZIP_URL)
@@ -169,7 +186,7 @@ def _fed_dti_frames():
 
 st.set_page_config(
     page_title="Housing market tracker",
-    page_icon="",
+    page_icon="🏠",
     layout="wide",
 )
 
@@ -180,78 +197,81 @@ st.caption(
 )
 
 with st.sidebar:
-    st.header("Data refresh")
-    if st.button("Refresh statewide data (fast ~9 MB)", use_container_width=True):
-        with st.spinner("Downloading state-level file…"):
-            try:
-                n = ingest_states(DB_PATH)
-                st.success(f"Upserted {n:,} state-month rows.")
-            except Exception as e:
-                st.error(f"State refresh failed: {e}")
-
-    _st_conn = _conn()
-    _states_sidebar = list_states(_st_conn)
-    _st_conn.close()
-    sel_state = st.selectbox(
-        "State (full name, e.g. Utah)",
-        options=_states_sidebar or ["— load state data first —"],
-        index=0,
-        disabled=not _states_sidebar,
-    )
-    if not _states_sidebar:
-        sel_state = ""
-
-    if sel_state and st.button(
-        "Load metros for this state (~100 MB total file)",
-        use_container_width=True,
-    ):
-        code = state_name_to_code(sel_state, DB_PATH)
-        if not code:
-            st.error("Could not resolve state code; refresh state data first.")
-        else:
-            with st.spinner(f"Downloading metros in {code}…"):
-                try:
-                    n = ingest_metros(DB_PATH, state_code=code)
-                    st.success(f"Upserted {n:,} metro-month rows for {code}.")
-                except Exception as e:
-                    st.error(f"Metro load failed: {e}")
-
-    if sel_state and st.button(
-        "Load cities for this state (streams ~1 GB national file)",
-        use_container_width=True,
-    ):
-        st.warning(
-            "Redfin’s city file is large; this streams the full compressed file and keeps "
-            f"only **{sel_state}**. It can take several minutes."
+    st.header("Controls")
+    with st.expander("Region", expanded=True):
+        _st_conn = _conn()
+        _states_sidebar = list_states(_st_conn)
+        _st_conn.close()
+        sel_state = st.selectbox(
+            "State",
+            options=_states_sidebar or ["— load state data first —"],
+            index=0,
+            disabled=not _states_sidebar,
+            help="Full state name as in Redfin (e.g. Utah).",
         )
-        prog = st.progress(0.0, text="Starting…")
+        if not _states_sidebar:
+            sel_state = ""
+        level = st.radio(
+            "Geography type",
+            options=["State", "Metro", "City"],
+            horizontal=False,
+            help="State uses statewide series; Metro/City need a sidebar download first.",
+        )
 
-        def on_prog(rows_seen: int, rows_kept: int):
-            prog.progress(
-                min(0.99, rows_seen / 6_000_000.0),
-                text=f"Scanned ~{rows_seen:,} source rows · kept {rows_kept:,} for {sel_state}",
+    with st.expander("Download / update data", expanded=False):
+        st.caption("One-time or occasional downloads from Redfin (uses **Region** state above).")
+        if st.button("Refresh statewide data (fast ~9 MB)", use_container_width=True):
+            with st.spinner("Downloading state-level file…"):
+                try:
+                    n = ingest_states(DB_PATH)
+                    st.success(f"Upserted {n:,} state-month rows.")
+                except Exception as e:
+                    st.error(f"State refresh failed: {e}")
+
+        if sel_state and not sel_state.startswith("—") and st.button(
+            "Load metros for this state (~100 MB total file)",
+            use_container_width=True,
+        ):
+            code = state_name_to_code(sel_state, DB_PATH)
+            if not code:
+                st.error("Could not resolve state code; refresh state data first.")
+            else:
+                with st.spinner(f"Downloading metros in {code}…"):
+                    try:
+                        n = ingest_metros(DB_PATH, state_code=code)
+                        st.success(f"Upserted {n:,} metro-month rows for {code}.")
+                    except Exception as e:
+                        st.error(f"Metro load failed: {e}")
+
+        if sel_state and not sel_state.startswith("—") and st.button(
+            "Load cities for this state (streams ~1 GB national file)",
+            use_container_width=True,
+        ):
+            st.warning(
+                "Redfin’s city file is large; this streams the full compressed file and keeps "
+                f"only **{sel_state}**. It can take several minutes."
             )
+            prog = st.progress(0.0, text="Starting…")
 
-        try:
-            n = ingest_cities_for_state(DB_PATH, sel_state, progress=on_prog)
-            prog.progress(1.0, text="Done")
-            st.success(f"Upserted {n:,} city-month rows for {sel_state}.")
-        except Exception as e:
-            st.error(f"City load failed: {e}")
+            def on_prog(rows_seen: int, rows_kept: int):
+                prog.progress(
+                    min(0.99, rows_seen / 6_000_000.0),
+                    text=f"Scanned ~{rows_seen:,} source rows · kept {rows_kept:,} for {sel_state}",
+                )
 
-    st.divider()
-    level = st.radio(
-        "Geography",
-        options=["State", "Metro", "City"],
-        horizontal=False,
-    )
+            try:
+                n = ingest_cities_for_state(DB_PATH, sel_state, progress=on_prog)
+                prog.progress(1.0, text="Done")
+                st.success(f"Upserted {n:,} city-month rows for {sel_state}.")
+            except Exception as e:
+                st.error(f"City load failed: {e}")
 
 conn = _conn()
 states = list_states(conn)
 if not states:
     st.info(
-        'Use the sidebar button **"Refresh statewide data"** to download Redfin state metrics, '
-        "then pick a state."
+        "Open the sidebar → **Download / update data** → **Refresh statewide data**, "
+        "then choose a state under **Region**."
     )
     conn.close()
     st.stop()
@@ -266,6 +286,12 @@ if level == "Metro":
 elif level == "City":
     city_options = list_regions_for_state(conn, "place", sel_state)
 
+st.subheader("Where you're looking")
+st.caption(
+    f"**State:** {sel_state} · **Geography type:** {level}. "
+    "Change these in the sidebar under **Region**."
+)
+
 region: str | None = None
 if level == "State":
     region_type = "state"
@@ -276,7 +302,7 @@ elif level == "Metro":
     if not metro_options:
         st.warning(
             f"No metro rows in the database for **{sel_state}** yet. "
-            "Click **Load metros for this state** in the sidebar."
+            "Sidebar → **Download / update data** → **Load metros for this state**."
         )
         conn.close()
         st.stop()
@@ -287,11 +313,15 @@ else:
     if not city_options:
         st.warning(
             f"No city rows for **{sel_state}** yet. "
-            "Click **Load cities for this state** (large download) in the sidebar."
+            "Sidebar → **Download / update data** → **Load cities for this state** (large download)."
         )
         conn.close()
         st.stop()
-    filter_q = st.text_input("Filter cities (optional)", "")
+    filter_q = st.text_input(
+        "Filter cities (optional)",
+        "",
+        help="Narrows the list as you type; no extra button.",
+    )
     opts = city_options
     if filter_q.strip():
         qn = normalize_city_query(filter_q)
@@ -323,11 +353,15 @@ price_trend = trend_from_change(mom_f)
 st.subheader("Housing snapshot")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric("Price trend (MoM)", price_trend.replace("unknown", "n/a").title())
+    st.metric(
+        "Price vs prior month",
+        price_trend.replace("unknown", "n/a").title(),
+        help="Direction of month-over-month change in median sale price (small moves count as flat).",
+    )
 with c2:
     v = latest["median_sale_price"] if latest is not None else None
     st.metric(
-        "Median sale (latest month)",
+        "Latest median sale price",
         f"${float(v):,.0f}" if v is not None and pd.notna(v) else "—",
     )
 with c3:
@@ -344,180 +378,17 @@ with c4:
     )
 
 st.divider()
-st.subheader("Consumer Financial Pressure Index")
-st.caption(
-    "**0–30** = very secure · **31–60** = moderate pressure · **61–100** = high pressure. "
-    "Blends Fed **DTI**, BEA **PCE vs income** growth, **Redfin** housing softness, state **unemployment** "
-    "(from [FRED](https://fred.stlouisfed.org/) public CSV — no API key)."
-)
-
-try:
-    postal_idx = _state_postal_from_row(latest, sel_state)
-except KeyError:
-    postal_idx = ""
-
-dti_mid: float | None = None
-try:
-    state_dti_df, _ = _fed_dti_frames()
-    _st_dti_row = latest_state_dti_row(state_dti_df, sel_state)
-    if _st_dti_row is not None:
-        dti_mid = (float(_st_dti_row["low"]) + float(_st_dti_row["high"])) / 2.0
-except Exception:
-    pass
-
-inc_y = pce_y = None
-pack_bea = None
-if BEA_API_KEY and postal_idx:
-    mc_bea = _metro_code_from_frame(df) if level != "State" else None
-    pack_bea = _bea_barometer_cached(level, postal_idx, mc_bea, BEA_API_KEY)
-    inc, pce = pack_bea["income"], pack_bea["pce"]
-    if inc.error:
-        st.warning(f"BEA income: {inc.error}")
-    if pce.error:
-        st.warning(f"BEA PCE: {pce.error}")
-    inc_y = inc.yoy_pct if inc.error is None else None
-    pce_y = pce.yoy_pct if pce.error is None else None
-    b1, b2 = st.columns(2)
-    with b1:
-        st.metric(
-            "State income YoY (BEA, Q)",
-            f"{float(inc_y) * 100:+.1f}%"
-            if inc_y is not None and pd.notna(inc_y)
-            else "—",
-            help="Latest quarter vs same quarter prior year.",
-        )
-    with b2:
-        st.metric(
-            "State PCE YoY (BEA, annual)",
-            f"{float(pce_y) * 100:+.1f}%"
-            if pce_y is not None and pd.notna(pce_y)
-            else "—",
-            help="Latest year vs prior (not same frequency as income — gap is indicative).",
-        )
-    st.caption(pack_bea["scope_note"])
-elif not BEA_API_KEY:
-    st.warning("Set **`BEA_API_KEY`** for income and PCE in this index.")
-
-
-def _fv(key: str):
-    if latest is None or key not in latest.index:
-        return None
-    v = latest[key]
-    try:
-        return float(v) if pd.notna(v) else None
-    except (TypeError, ValueError):
-        return None
-
-
-un_rate, un_date, un_sid = latest_state_unemployment_rate(postal_idx)
-
-composite = compute_composite_pressure(
-    dti_mid=dti_mid,
-    income_yoy=inc_y,
-    pce_yoy=pce_y,
-    median_dom=_fv("median_dom"),
-    inventory_mom=_fv("inventory_mom"),
-    median_dom_mom=_fv("median_dom_mom"),
-    unemployment_pct=un_rate,
-)
-
-gu, br = st.columns([1, 1])
-with gu:
-    if pack_bea:
-        _inc, _pce = pack_bea["income"], pack_bea["pce"]
-        gauge_sub = (
-            f"{composite.zone} · Income: {_inc.latest_period or '—'} · "
-            f"PCE: {_pce.latest_period or '—'}"
-        )
-    else:
-        gauge_sub = composite.zone
-    st.plotly_chart(
-        composite_pressure_gauge_figure(composite.index, gauge_sub),
-        use_container_width=True,
-    )
-with br:
-    st.metric("Index", f"{composite.index:.1f}", help="Weighted blend; higher = more consumer pressure.")
-    if dti_mid is not None:
-        st.metric("DTI midpoint (state, Fed)", f"{dti_mid:.2f}")
-    if un_rate is not None:
-        st.metric(
-            "Unemployment (state, FRED)",
-            f"{un_rate:.2f}%",
-            f"{un_sid or ''} · {un_date or ''}",
-        )
-    else:
-        st.metric("Unemployment (state, FRED)", "—", "CSV fetch failed")
-    if inc_y is not None and pce_y is not None:
-        st.metric(
-            "PCE YoY − income YoY (approx.)",
-            f"{(float(pce_y) - float(inc_y)) * 100:+.1f} pp",
-        )
-
-st.subheader("Factor breakdown (subscores 0–100, higher = more pressure)")
-st.dataframe(composite.detail_rows, use_container_width=True, hide_index=True)
-st.info(
-    "**Weights:** DTI 35%, PCE−income gap 18%, housing (DOM + inventory) 22%, income YoY 13%, "
-    "state unemployment (FRED) 12%. Income is **quarterly** YoY vs prior year quarter; PCE is **annual** YoY — "
-    "the gap is indicative, not an exact national-accounts residual."
-)
-
-st.divider()
-st.subheader("Debt-to-income ratio (budget tightness)")
-st.caption(
-    "[Federal Reserve Z.1 Data Visualization](https://www.federalreserve.gov/releases/z1/default.htm) "
-    "— household debt-to-income **ranges** (low–high) by state and by MSA. Quarterly."
-)
-
-try:
-    state_dti_df, msa_dti_df = _fed_dti_frames()
-    dti_left, dti_right = st.columns(2)
-    st_dti = latest_state_dti_row(state_dti_df, sel_state)
-    with dti_left:
-        if st_dti is not None:
-            st.markdown(f"**{sel_state}** (state)")
-            st.metric(
-                "Debt-to-income (range)",
-                format_dti_range(st_dti),
-                help="Fed low–high band for the state.",
-            )
-            st.caption(format_dti_period(st_dti))
-        else:
-            st.warning(f"No state DTI for **{sel_state}**.")
-
-    mc_dti = _metro_code_from_frame(df) if level != "State" else None
-    with dti_right:
-        if level != "State" and mc_dti:
-            m_row = latest_msa_dti_row(msa_dti_df, mc_dti)
-            if m_row is not None:
-                st.markdown(f"**MSA** `{mc_dti}`")
-                st.metric(
-                    "Debt-to-income (range)",
-                    format_dti_range(m_row),
-                    help="Fed low–high band for this metropolitan area.",
-                )
-                st.caption(format_dti_period(m_row))
-            else:
-                st.info(f"No MSA row for CBSA **{mc_dti}** in the Fed extract.")
-        elif level != "State":
-            st.caption("Re-ingest **metro/city** so `metro_code` is present for MSA DTI.")
-
-    st.info(
-        "**Rough read (midpoint):** ~1.0–1.4 often more **comfortable**, ~1.5–1.8 **moderate**, "
-        "above ~**1.8** **tighter** — see Fed documentation for definitions."
-    )
-except Exception as e:
-    st.error(f"Could not load Federal Reserve DTI files: {e}")
-
-st.divider()
+st.subheader("At a glance")
 st.markdown(summary_markdown(latest, label))
 
+st.subheader("Trends")
 try:
     fig = _figure_timeseries(df, label)
     st.plotly_chart(fig, use_container_width=True)
 except Exception as e:
     st.warning(f"Could not build chart: {e}")
 
-st.subheader("Recent months (table)")
+st.subheader("Recent months")
 show = df.sort_values("period_begin", ascending=False).head(24)
 cols = [
     "period_begin",
@@ -565,7 +436,183 @@ if "months_of_supply" in display.columns:
     display["months_of_supply"] = display["months_of_supply"].apply(
         lambda x: f"{float(x):.1f}" if pd.notna(x) else "—"
     )
-st.dataframe(display, use_container_width=True, hide_index=True)
+st.dataframe(display, use_container_width=True, hide_index=True, height=420)
+
+st.divider()
+st.subheader("Consumer Financial Pressure Index")
+st.caption(
+    "**0–30** comfortable · **31–60** moderate pressure · **61–100** high pressure. "
+    "Blends Fed **DTI**, BEA income vs spending, **Redfin** housing softness, and state **unemployment** "
+    "([FRED](https://fred.stlouisfed.org/) public data — no API key)."
+)
+
+with st.spinner("Loading macro indicators (BEA, FRED, Fed DTI)…"):
+    try:
+        postal_idx = _state_postal_from_row(latest, sel_state)
+    except KeyError:
+        postal_idx = ""
+
+    dti_mid: float | None = None
+    try:
+        state_dti_df, _ = _fed_dti_frames()
+        _st_dti_row = latest_state_dti_row(state_dti_df, sel_state)
+        if _st_dti_row is not None:
+            dti_mid = (float(_st_dti_row["low"]) + float(_st_dti_row["high"])) / 2.0
+    except Exception:
+        pass
+
+    inc_y = pce_y = None
+    pack_bea = None
+    if BEA_API_KEY and postal_idx:
+        mc_bea = _metro_code_from_frame(df) if level != "State" else None
+        pack_bea = _bea_barometer_cached(level, postal_idx, mc_bea, BEA_API_KEY)
+        inc, pce = pack_bea["income"], pack_bea["pce"]
+        if inc.error:
+            st.warning(f"BEA income: {inc.error}")
+        if pce.error:
+            st.warning(f"BEA PCE: {pce.error}")
+        inc_y = inc.yoy_pct if inc.error is None else None
+        pce_y = pce.yoy_pct if pce.error is None else None
+        b1, b2 = st.columns(2)
+        with b1:
+            st.metric(
+                "State income vs year-ago quarter",
+                f"{float(inc_y) * 100:+.1f}%"
+                if inc_y is not None and pd.notna(inc_y)
+                else "—",
+                help="BEA quarterly personal income: latest quarter vs same quarter last year.",
+            )
+        with b2:
+            st.metric(
+                "State spending vs prior year (PCE)",
+                f"{float(pce_y) * 100:+.1f}%"
+                if pce_y is not None and pd.notna(pce_y)
+                else "—",
+                help="BEA annual personal consumption for the state; not the same frequency as income — gap is indicative.",
+            )
+        st.caption(pack_bea["scope_note"])
+    elif not BEA_API_KEY:
+        st.warning("Set **`BEA_API_KEY`** for income and PCE in this index.")
+
+    un_rate, un_date, un_sid = _fred_unemployment_cached(postal_idx)
+
+    composite = compute_composite_pressure(
+        dti_mid=dti_mid,
+        income_yoy=inc_y,
+        pce_yoy=pce_y,
+        median_dom=_latest_float(latest, "median_dom"),
+        inventory_mom=_latest_float(latest, "inventory_mom"),
+        median_dom_mom=_latest_float(latest, "median_dom_mom"),
+        unemployment_pct=un_rate,
+    )
+
+    gu, br = st.columns([1, 1])
+    with gu:
+        if pack_bea:
+            _inc, _pce = pack_bea["income"], pack_bea["pce"]
+            gauge_sub = (
+                f"{composite.zone} · Income: {_inc.latest_period or '—'} · "
+                f"PCE: {_pce.latest_period or '—'}"
+            )
+        else:
+            gauge_sub = composite.zone
+        st.plotly_chart(
+            composite_pressure_gauge_figure(composite.index, gauge_sub),
+            use_container_width=True,
+        )
+    with br:
+        st.metric(
+            "Index",
+            f"{composite.index:.1f}",
+            help="Weighted blend; higher = more consumer financial pressure.",
+        )
+        if dti_mid is not None:
+            st.metric(
+                "DTI midpoint (state)",
+                f"{dti_mid:.2f}",
+                help="Midpoint of the Fed Z.1 household debt-to-income band for this state (feeds the index).",
+            )
+        if un_rate is not None:
+            st.metric(
+                "Unemployment (state)",
+                f"{un_rate:.2f}%",
+                f"{un_sid or ''} · {un_date or ''}",
+                help="State rate from FRED (public CSV); series shown in delta line.",
+            )
+        else:
+            st.metric(
+                "Unemployment (state)",
+                "—",
+                "Could not load FRED CSV",
+                help="Often a timeout or network block; index still runs with a neutral subscore.",
+            )
+        if inc_y is not None and pce_y is not None:
+            st.metric(
+                "Spending growth minus income growth",
+                f"{(float(pce_y) - float(inc_y)) * 100:+.1f} pp",
+                help="Approximate gap (annual PCE YoY minus quarterly income YoY); not a national-accounts residual.",
+            )
+
+with st.expander("How this index is built (weights, caveats, factor table)", expanded=False):
+    st.info(
+        "**Weights:** DTI 35%, PCE−income gap 18%, housing (DOM + inventory momentum) 22%, income YoY 13%, "
+        "state unemployment (FRED) 12%. Income is **quarterly** YoY vs prior-year quarter; PCE is **annual** YoY — "
+        "the gap is indicative, not an exact national-accounts residual."
+    )
+    st.markdown("**Factor scores (0–100; higher = more pressure)**")
+    st.dataframe(composite.detail_rows, use_container_width=True, hide_index=True)
+
+st.caption(
+    "The **DTI midpoint** beside the gauge uses the same Federal Reserve Z.1 household series as the section below — "
+    "that block shows the full **low–high range** by state and (when available) by metro."
+)
+
+st.divider()
+st.subheader("Debt-to-income ratio (budget tightness)")
+st.caption(
+    "[Federal Reserve Z.1 Data Visualization](https://www.federalreserve.gov/releases/z1/default.htm) "
+    "— household debt-to-income **ranges** (low–high) by state and by MSA. Quarterly."
+)
+
+try:
+    state_dti_df, msa_dti_df = _fed_dti_frames()
+    dti_left, dti_right = st.columns(2)
+    st_dti = latest_state_dti_row(state_dti_df, sel_state)
+    with dti_left:
+        if st_dti is not None:
+            st.markdown(f"**{sel_state}** (state)")
+            st.metric(
+                "Debt-to-income (range)",
+                format_dti_range(st_dti),
+                help="Fed low–high band for the state.",
+            )
+            st.caption(format_dti_period(st_dti))
+        else:
+            st.warning(f"No state DTI for **{sel_state}**.")
+
+    mc_dti = _metro_code_from_frame(df) if level != "State" else None
+    with dti_right:
+        if level != "State" and mc_dti:
+            m_row = latest_msa_dti_row(msa_dti_df, mc_dti)
+            if m_row is not None:
+                st.markdown(f"**Metro area** (Fed CBSA **{mc_dti}**)")
+                st.metric(
+                    "Debt-to-income (range)",
+                    format_dti_range(m_row),
+                    help="Fed low–high band for this metropolitan area.",
+                )
+                st.caption(format_dti_period(m_row))
+            else:
+                st.info(f"No metro row for Fed CBSA **{mc_dti}** in this extract.")
+        elif level != "State":
+            st.caption("Re-ingest **metro/city** so `metro_code` is present for MSA DTI.")
+
+    st.info(
+        "**Rough read (midpoint):** ~1.0–1.4 often more **comfortable**, ~1.5–1.8 **moderate**, "
+        "above ~**1.8** **tighter** — see Fed documentation for definitions."
+    )
+except Exception as e:
+    st.error(f"Could not load Federal Reserve DTI files: {e}")
 
 st.caption(
     "**Sources:** Housing — [Redfin Data Center](https://www.redfin.com/news/data-center/) · "
