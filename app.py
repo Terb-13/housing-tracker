@@ -159,7 +159,7 @@ def _bea_barometer_cached(
                 yoy_pct=None,
                 geo_name=None,
                 table_used="MAINC1",
-                error="No CBSA `metro_code` on file — re-run **Load metros** or **Load cities** to refresh Redfin metadata.",
+                error="No CBSA `metro_code` on file — choose **Metro** or **City** for this state so Redfin metadata loads into the database.",
             )
         scope_note = (
             "**Income:** metropolitan statistical area (CBSA) annual personal income (latest year vs prior). "
@@ -215,44 +215,38 @@ with st.sidebar:
             "Geography type",
             options=["State", "Metro", "City"],
             horizontal=False,
-            help="State: ready after statewide refresh. Metro: use **Load metros** once. "
-            "City: data downloads automatically the first time you pick a state (large one-time stream).",
+            help="Redfin data loads automatically: state (~9 MB), metro (~100 MB national file), "
+            "or city (~1 GB stream) the first time that layer is missing for your state.",
         )
-
-    with st.expander("Download / update data", expanded=False):
-        st.caption("State and metro pulls from Redfin (uses **Region** state above). City data loads on its own when you choose **City**.")
-        if st.button("Refresh statewide data (fast ~9 MB)", use_container_width=True):
-            with st.spinner("Downloading state-level file…"):
-                try:
-                    n = ingest_states(DB_PATH)
-                    st.success(f"Upserted {n:,} state-month rows.")
-                except Exception as e:
-                    st.error(f"State refresh failed: {e}")
-
-        if sel_state and not sel_state.startswith("—") and st.button(
-            "Load metros for this state (~100 MB total file)",
-            use_container_width=True,
-        ):
-            code = state_name_to_code(sel_state, DB_PATH)
-            if not code:
-                st.error("Could not resolve state code; refresh state data first.")
-            else:
-                with st.spinner(f"Downloading metros in {code}…"):
-                    try:
-                        n = ingest_metros(DB_PATH, state_code=code)
-                        st.success(f"Upserted {n:,} metro-month rows for {code}.")
-                    except Exception as e:
-                        st.error(f"Metro load failed: {e}")
+        st.caption("No manual downloads — pick a state and geography; the app fetches what it needs once.")
 
 conn = _conn()
 states = list_states(conn)
 if not states:
-    st.info(
-        "Open the sidebar → **Download / update data** → **Refresh statewide data**, "
-        "then choose a state under **Region**."
-    )
+    _state_err = "state_ingest_error"
+    if _state_err in st.session_state:
+        st.error(f"Could not load state data: {st.session_state[_state_err]}")
+        if st.button("Retry loading state data", key="retry_states"):
+            del st.session_state[_state_err]
+            st.rerun()
+        conn.close()
+        st.stop()
+
     conn.close()
-    st.stop()
+    st.subheader("Loading state data")
+    st.info(
+        "**First launch:** downloading Redfin’s **state-level** file (~9 MB). "
+        "After this, the state list fills in and you can pick a region."
+    )
+    try:
+        _n_state = ingest_states(DB_PATH)
+    except Exception as e:
+        st.session_state[_state_err] = str(e)
+        st.rerun()
+    if _n_state == 0:
+        st.session_state[_state_err] = "No state rows were ingested — check your network or try again."
+        st.rerun()
+    st.rerun()
 
 if not sel_state or sel_state.startswith("—"):
     sel_state = states[0]
@@ -261,6 +255,44 @@ metro_options: list[str] = []
 city_options: list[str] = []
 if level == "Metro":
     metro_options = list_regions_for_state(conn, "metro", sel_state)
+    if not metro_options:
+        _metro_err = f"metro_ingest_error:{sel_state}"
+        if _metro_err in st.session_state:
+            st.error(
+                f"Could not load metro data for **{sel_state}**: {st.session_state[_metro_err]}"
+            )
+            if st.button("Retry loading metro data", key=f"retry_metros_{sel_state}"):
+                del st.session_state[_metro_err]
+                st.rerun()
+            conn.close()
+            st.stop()
+
+        _st_abbr = state_name_to_code(sel_state, DB_PATH)
+        if not _st_abbr:
+            st.session_state[_metro_err] = (
+                f"No state code found for **{sel_state}** in the database — "
+                "state-level Redfin data may be missing or spelled differently."
+            )
+            st.rerun()
+
+        conn.close()
+        st.subheader("Loading metro data")
+        st.info(
+            f"**One-time setup for {sel_state}:** Redfin ships one **national** metro file (~100 MB compressed). "
+            f"This download keeps only metros in **{sel_state}**; it usually takes about a minute."
+        )
+        try:
+            with st.spinner(f"Downloading metros for {_st_abbr}…"):
+                _n_metro = ingest_metros(DB_PATH, state_code=_st_abbr)
+        except Exception as e:
+            st.session_state[_metro_err] = str(e)
+            st.rerun()
+        if _n_metro == 0:
+            st.session_state[_metro_err] = (
+                f"No metro rows were stored for **{sel_state}**. Try **Retry loading metro data**."
+            )
+            st.rerun()
+        st.rerun()
 elif level == "City":
     city_options = list_regions_for_state(conn, "place", sel_state)
     if not city_options:
@@ -299,7 +331,7 @@ elif level == "City":
         if _n_city == 0:
             st.session_state[_city_err] = (
                 "No city rows matched this state. Confirm **State** matches Redfin’s spelling, "
-                "or refresh statewide data and try again."
+                "or reload the app so state data can sync."
             )
             st.rerun()
         st.rerun()
@@ -319,8 +351,7 @@ elif level == "Metro":
     region_type = "metro"
     if not metro_options:
         st.warning(
-            f"No metro rows in the database for **{sel_state}** yet. "
-            "Sidebar → **Download / update data** → **Load metros for this state**."
+            f"No metro list for **{sel_state}** after loading. Use **Retry loading metro data** above if this persists."
         )
         conn.close()
         st.stop()
