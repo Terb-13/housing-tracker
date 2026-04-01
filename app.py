@@ -215,11 +215,12 @@ with st.sidebar:
             "Geography type",
             options=["State", "Metro", "City"],
             horizontal=False,
-            help="State uses statewide series; Metro/City need a sidebar download first.",
+            help="State: ready after statewide refresh. Metro: use **Load metros** once. "
+            "City: data downloads automatically the first time you pick a state (large one-time stream).",
         )
 
     with st.expander("Download / update data", expanded=False):
-        st.caption("One-time or occasional downloads from Redfin (uses **Region** state above).")
+        st.caption("State and metro pulls from Redfin (uses **Region** state above). City data loads on its own when you choose **City**.")
         if st.button("Refresh statewide data (fast ~9 MB)", use_container_width=True):
             with st.spinner("Downloading state-level file…"):
                 try:
@@ -243,29 +244,6 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"Metro load failed: {e}")
 
-        if sel_state and not sel_state.startswith("—") and st.button(
-            "Load cities for this state (streams ~1 GB national file)",
-            use_container_width=True,
-        ):
-            st.warning(
-                "Redfin’s city file is large; this streams the full compressed file and keeps "
-                f"only **{sel_state}**. It can take several minutes."
-            )
-            prog = st.progress(0.0, text="Starting…")
-
-            def on_prog(rows_seen: int, rows_kept: int):
-                prog.progress(
-                    min(0.99, rows_seen / 6_000_000.0),
-                    text=f"Scanned ~{rows_seen:,} source rows · kept {rows_kept:,} for {sel_state}",
-                )
-
-            try:
-                n = ingest_cities_for_state(DB_PATH, sel_state, progress=on_prog)
-                prog.progress(1.0, text="Done")
-                st.success(f"Upserted {n:,} city-month rows for {sel_state}.")
-            except Exception as e:
-                st.error(f"City load failed: {e}")
-
 conn = _conn()
 states = list_states(conn)
 if not states:
@@ -285,6 +263,46 @@ if level == "Metro":
     metro_options = list_regions_for_state(conn, "metro", sel_state)
 elif level == "City":
     city_options = list_regions_for_state(conn, "place", sel_state)
+    if not city_options:
+        _city_err = f"city_ingest_error:{sel_state}"
+        if _city_err in st.session_state:
+            st.error(
+                f"Could not load city data for **{sel_state}**: {st.session_state[_city_err]}"
+            )
+            if st.button("Retry loading city data", key=f"retry_cities_{sel_state}"):
+                del st.session_state[_city_err]
+                st.rerun()
+            conn.close()
+            st.stop()
+
+        conn.close()
+        st.subheader("Loading city data")
+        st.info(
+            f"**One-time setup for {sel_state}:** Redfin only publishes a **single national** city file "
+            "(~1 GB compressed). This app streams it once and keeps rows for **{sel_state}** only; "
+            "it often takes several minutes. Later visits use your local copy."
+        )
+        _prog = st.progress(0.0, text="Starting…")
+
+        def _city_prog(rows_seen: int, rows_kept: int):
+            _prog.progress(
+                min(0.99, rows_seen / 6_000_000.0),
+                text=f"Scanned ~{rows_seen:,} source rows · kept {rows_kept:,} for {sel_state}",
+            )
+
+        try:
+            _n_city = ingest_cities_for_state(DB_PATH, sel_state, progress=_city_prog)
+        except Exception as e:
+            st.session_state[_city_err] = str(e)
+            st.rerun()
+        _prog.progress(1.0, text="Done")
+        if _n_city == 0:
+            st.session_state[_city_err] = (
+                "No city rows matched this state. Confirm **State** matches Redfin’s spelling, "
+                "or refresh statewide data and try again."
+            )
+            st.rerun()
+        st.rerun()
 
 st.subheader("Where you're looking")
 st.caption(
@@ -312,8 +330,7 @@ else:
     region_type = "place"
     if not city_options:
         st.warning(
-            f"No city rows for **{sel_state}** yet. "
-            "Sidebar → **Download / update data** → **Load cities for this state** (large download)."
+            f"No city rows for **{sel_state}** after loading. Use **Retry loading city data** above if this persists."
         )
         conn.close()
         st.stop()
